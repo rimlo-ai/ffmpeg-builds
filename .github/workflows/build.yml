@@ -1,0 +1,97 @@
+name: Build
+
+# Every push builds and tests all targets. A tag named <ffmpeg version>-r<revision>
+# (matching versions.sh) also publishes them as a release.
+on:
+  push:
+    branches: [main]
+    tags: ['*-r*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: darwin-arm64, runner: macos-15 }
+          - { target: darwin-x64, runner: macos-15-intel }
+          - { target: linux-x64, runner: ubuntu-24.04 }
+          - { target: linux-arm64, runner: ubuntu-24.04-arm }
+          - { target: win32-x64, runner: ubuntu-24.04 }
+          - { target: win32-arm64, runner: ubuntu-24.04 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: matrix.target == 'darwin-x64'
+        run: brew install nasm
+      - run: ./build.sh ${{ matrix.target }} "$RUNNER_TEMP/work"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ runner.temp }}/work/dist/*
+          if-no-files-found: error
+
+  test:
+    name: Test ${{ matrix.target }} on ${{ matrix.runner }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: darwin-arm64, runner: macos-14 }
+          - { target: darwin-arm64, runner: macos-26 }
+          - { target: darwin-x64, runner: macos-15-intel }
+          - { target: linux-x64, runner: ubuntu-22.04 }
+          - { target: linux-arm64, runner: ubuntu-24.04-arm }
+          - { target: win32-x64, runner: windows-2025 }
+          - { target: win32-arm64, runner: windows-11-arm }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: dist
+      # Unpack the way Rimlo does: tar, which on Windows is the system's bsdtar.
+      - name: Unpack
+        run: |
+          mkdir build
+          if [ "$RUNNER_OS" = Windows ]; then
+            /c/Windows/System32/tar.exe -xf dist/*.zip -C build
+          else
+            tar -xJf dist/*.tar.xz -C build
+          fi
+          ls -lR build
+      - run: ./test.sh build/bin/ffmpeg${{ runner.os == 'Windows' && '.exe' || '' }}
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ./release.sh dist "$RUNNER_TEMP/notes.md"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/ffmpeg-*-r*-*
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "FFmpeg $GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+        env:
+          GH_TOKEN: ${{ github.token }}

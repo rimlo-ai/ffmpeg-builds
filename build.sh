@@ -28,10 +28,31 @@ os=${target%-*}
 arch=${target#*-}
 name=ffmpeg-$FFMPEG_VERSION-r$REVISION-$target
 
+# On GitHub Actions, failures also become annotations, which (unlike logs) anyone can read.
+annotate() {
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    local percent=% newline=$'\n' message
+    message=${1//"$percent"/%25}
+    echo "::error title=build.sh $target::${message//"$newline"/%0A}" >&2
+  fi
+}
+
 die() {
   echo "build.sh: $*" >&2
+  annotate "$*"
   exit 1
 }
+
+# Fails with the end of a log, which is where compilers and configure scripts say why.
+die_with_log() { # log message
+  local tail
+  tail=$(tail -n 25 "$1")
+  echo "$tail" >&2
+  die "$2"$'\n'"$tail"
+}
+
+set -E
+trap 'annotate "line $LINENO: $BASH_COMMAND failed"' ERR
 
 case $target in
   darwin-arm64 | darwin-x64 | linux-x64 | linux-arm64 | win32-x64 | win32-arm64) ;;
@@ -45,17 +66,20 @@ if [ "$os" != darwin ] && [ -z "${IN_BUILD_CONTAINER:-}" ]; then
   if [ "$os" = linux ]; then
     image=$ALPINE_IMAGE
     platform=linux/${arch/x64/amd64}
-    setup="apk add --no-cache bash build-base curl diffutils linux-headers perl pkgconf tar xz"
-    [ "$arch" = x64 ] && setup+=" nasm"
+    install="apk add --no-cache bash build-base curl diffutils linux-headers perl pkgconf tar xz"
+    [ "$arch" = x64 ] && install+=" nasm"
   else
     image=$UBUNTU_IMAGE
     platform= # The host's own: llvm-mingw targets both architectures from either.
-    setup="apt-get update -qq && apt-get install -qq -y --no-install-recommends"
-    setup+=" ca-certificates curl gcc git libc6-dev make nasm perl pkg-config xz-utils zip >/dev/null"
+    install="apt-get update -qq && apt-get install -qq -y --no-install-recommends"
+    install+=" ca-certificates curl gcc git libc6-dev make nasm perl pkg-config xz-utils zip >/dev/null"
   fi
+  # Package mirrors fail now and then: try three times.
+  setup="for i in 1 2 3; do $install && break; [ \$i = 3 ] && exit 1; sleep 20; done"
   # Compile in the container's own filesystem; only the cache and results go to the mount.
-  exec docker run --rm ${platform:+--platform "$platform"} -e IN_BUILD_CONTAINER=1 -e BUILD_ROOT=/build \
-    -v "$here:/src:ro" -v "$work:/work" "$image" sh -c "$setup && /src/build.sh $target /work"
+  exec docker run --rm ${platform:+--platform "$platform"} -e GITHUB_ACTIONS \
+    -e IN_BUILD_CONTAINER=1 -e BUILD_ROOT=/build -v "$here:/src:ro" -v "$work:/work" \
+    "$image" sh -c "$setup && /src/build.sh $target /work"
 fi
 
 jobs=$(getconf _NPROCESSORS_ONLN)
@@ -82,7 +106,8 @@ sha256() {
 fetch() { # url sha256 [file name]
   local file=$cache/${3:-${1##*/}}
   if [ ! -f "$file" ]; then
-    curl -fsSL --retry 3 -o "$file.part" "$1"
+    curl -fsSL --show-error --retry 5 --retry-all-errors --connect-timeout 30 -o "$file.part" "$1" ||
+      die "couldn't download $1"
     mv "$file.part" "$file"
   fi
   [ "$(sha256 "$file")" = "$2" ] || die "checksum mismatch for $1"
@@ -159,10 +184,7 @@ build_libvpx() {
       "${as[@]}" &&
       make -j"$jobs" &&
       make install
-  ) >"$root/libvpx.log" 2>&1 || {
-    tail -n 40 "$root/libvpx.log"
-    die "libvpx failed"
-  }
+  ) >"$root/libvpx.log" 2>&1 || die_with_log "$root/libvpx.log" "libvpx failed"
 }
 
 # NVENC and AMF headers: FFmpeg loads the drivers' own DLLs at runtime.
@@ -172,7 +194,12 @@ install_nvenc() {
 }
 
 install_amf() {
-  git clone -q --filter=blob:none --no-checkout --depth 1 --branch "v$AMF_VERSION" "$AMF_REPO" "$src/amf"
+  for i in 1 2 3; do
+    git clone -q --filter=blob:none --no-checkout --depth 1 --branch "v$AMF_VERSION" "$AMF_REPO" "$src/amf" && break
+    rm -rf "$src/amf"
+    [ "$i" = 3 ] && die "couldn't clone $AMF_REPO"
+    sleep 20
+  done
   git -C "$src/amf" sparse-checkout set --no-cone /LICENSE.txt /amf/public/include
   git -C "$src/amf" checkout -q
   [ "$(git -C "$src/amf" rev-parse HEAD)" = "$AMF_COMMIT" ] || die "AMF v$AMF_VERSION isn't commit $AMF_COMMIT"
@@ -229,15 +256,9 @@ cd "$src/ffmpeg"
   --extra-ldflags="$ldflags -L$prefix/lib" \
   --pkg-config-flags=--static \
   "${config[@]}" \
-  --enable-encoder="$encoders" >"$root/configure.log" || {
-  tail -n 40 ffbuild/config.log
-  die "FFmpeg configure failed"
-}
+  --enable-encoder="$encoders" >"$root/configure.log" || die_with_log ffbuild/config.log "FFmpeg configure failed"
 grep -E '^(threading support|External libraries|Enabled encoders)' -A 4 "$root/configure.log" || true
-make -j"$jobs" >"$root/make.log" 2>&1 || {
-  tail -n 40 "$root/make.log"
-  die "FFmpeg build failed"
-}
+make -j"$jobs" >"$root/make.log" 2>&1 || die_with_log "$root/make.log" "FFmpeg build failed"
 
 exe=ffmpeg
 [ "$os" = win32 ] && exe=ffmpeg.exe

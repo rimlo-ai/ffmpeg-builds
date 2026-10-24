@@ -5,7 +5,7 @@
 FFMPEG_VERSION=8.1.3
 # Bump when the build changes but FFmpeg doesn't. Releases are tagged
 # $FFMPEG_VERSION-r$REVISION.
-REVISION=1
+REVISION=2
 
 FFMPEG_URL=https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz
 FFMPEG_SHA256=7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
